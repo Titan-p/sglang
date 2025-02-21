@@ -304,6 +304,9 @@ def get_hf_text_config(config: PretrainedConfig):
         setattr(config, "torch_dtype", torch.float16)
         return config
 
+    if class_name.startswith("InternVL"):
+        assert hasattr(config.llm_config, "num_attention_heads")
+        return config.llm_config
     if hasattr(config, "text_config"):
         # The code operates under the assumption that text_config should have
         # `num_attention_heads` (among others). Assert here to fail early
@@ -405,6 +408,7 @@ def is_multimodal_model(model_architectures: List[str]):
         or "Qwen2VLForConditionalGeneration" in model_architectures
         or "Qwen2_5_VLForConditionalGeneration" in model_architectures
         or "MiniCPMV" in model_architectures
+        or "InternVLChatModel" in model_architectures
     ):
         return True
     else:

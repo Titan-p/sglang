@@ -44,6 +44,7 @@ class SeparatorStyle(IntEnum):
     CHATGLM3 = auto()
     DEEPSEEK_CHAT = auto()
     METAMATH = auto()
+    MPT = auto()
 
 
 @dataclasses.dataclass
@@ -274,6 +275,16 @@ class Conversation:
                     ret += role + ": " + message + seps[i % 2]
                 else:
                     ret += role + ":"
+            return ret
+        elif self.sep_style == SeparatorStyle.MPT:
+            ret = system_prompt + self.sep
+            for role, message in self.messages:
+                if message:
+                    if type(message) is tuple:
+                        message, _, _ = message
+                    ret += role + message + self.sep
+                else:
+                    ret += role
             return ret
         else:
             raise ValueError(f"Invalid style: {self.sep_style}")
@@ -538,6 +549,19 @@ register_conv_template(
         roles=("<|im_start|>user", "<|im_start|>assistant"),
         sep="\n",
         stop_str=["<|im_end|>", "<|action_end|>"],
+    )
+)
+
+register_conv_template(
+    Conversation(
+        name="internvl-internlm2",
+        system_message="你是由上海人工智能实验室联合商汤科技开发的书生多模态大模型，英文名叫InternVL, 是一个有用无害的人工智能助手。",
+        system_template="<|im_start|>system\n{system_message}",
+        roles=("<|im_start|>user", "<|im_start|>assistant"),
+        sep="<|im_end|>",
+        stop_str=["<|im_end|>", "<|im_start|>", "</s>"],
+        image_token="<img><IMG_CONTEXT></img>",
+        sep_style=SeparatorStyle.MPT,
     )
 )
 

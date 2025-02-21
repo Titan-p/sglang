@@ -184,6 +184,14 @@ def get_tokenizer(
     return tokenizer
 
 
+class DummyInternVLProcessor:
+    # Because transformers.AutoProcessor is not compatible with InternVL models,
+    # we need to create a dummy processor that does nothing.
+    def __init__(self, model_path, **kwargs):
+        self.hf_config = get_config(model_path, **kwargs)
+        self.tokenizer = get_tokenizer(model_path, **kwargs)
+
+
 def get_processor(
     tokenizer_name: str,
     *args,
@@ -192,6 +200,14 @@ def get_processor(
     tokenizer_revision: Optional[str] = None,
     **kwargs,
 ):
+    if "internvl" in tokenizer_name.lower():
+        return DummyInternVLProcessor(
+            tokenizer_name,
+            *args,
+            trust_remote_code=trust_remote_code,
+            tokenizer_revision=tokenizer_revision,
+            **kwargs,
+        )
     processor = AutoProcessor.from_pretrained(
         tokenizer_name,
         *args,

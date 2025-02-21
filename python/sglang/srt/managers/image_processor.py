@@ -6,13 +6,17 @@ import logging
 import multiprocessing as mp
 import os
 from abc import ABC, abstractmethod
-from typing import List, Optional, Union
+from typing import Dict, List, Optional, Union
 
 import numpy as np
 import PIL
+import torch
+import torchvision.transforms as T
 import transformers
 from decord import VideoReader, cpu
 from PIL import Image
+from torchvision.transforms.functional import InterpolationMode
+from transformers.image_processing_utils import BatchFeature
 
 from sglang.srt.hf_transformers_utils import get_processor
 from sglang.srt.mm_utils import expand2square, process_anyres_image
@@ -29,11 +33,14 @@ def init_global_processor(server_args: ServerArgs):
     """Init the global processor for multi modal models."""
     global global_processor
     transformers.logging.set_verbosity_error()
-    global_processor = get_processor(
-        server_args.tokenizer_path,
-        tokenizer_mode=server_args.tokenizer_mode,
-        trust_remote_code=server_args.trust_remote_code,
-    )
+    if "internvl" in server_args.tokenizer_path.lower():
+        global_processor = InternVLImagePreProcessor()
+    else:
+        global_processor = get_processor(
+            server_args.tokenizer_path,
+            tokenizer_mode=server_args.tokenizer_mode,
+            trust_remote_code=server_args.trust_remote_code,
+        )
 
 
 @dataclasses.dataclass
@@ -627,6 +634,248 @@ class Qwen2_5VLImageProcessor(BaseImageProcessor):
         }
 
 
+class InternVLImagePreProcessor:
+    def __init__(
+        self,
+        do_resize=True,
+        size=448,
+        do_center_crop=True,
+        crop_size=448,
+        do_rescale=True,
+        do_normalize=True,
+        image_mean=(0.485, 0.456, 0.406),
+        image_std=(0.229, 0.224, 0.225),
+        do_convert_rgb=True,
+        max_num=12,
+        min_num=1,
+        use_thumbnail=True,
+        **kwargs,
+    ):
+        self.do_resize = do_resize
+        self.size = size
+        self.do_center_crop = do_center_crop
+        self.crop_size = crop_size
+        self.do_rescale = do_rescale
+        self.do_normalize = do_normalize
+        self.image_mean = image_mean
+        self.image_std = image_std
+        self.do_convert_rgb = do_convert_rgb
+        self.max_num = max_num
+        self.min_num = min_num
+        self.use_thumbnail = use_thumbnail
+
+        self.transform = self._build_transform(input_size=size)
+
+    def _build_transform(self, input_size):
+        MEAN, STD = self.image_mean, self.image_std
+        transform = T.Compose(
+            [
+                T.Lambda(lambda img: img.convert("RGB") if img.mode != "RGB" else img),
+                T.Resize(
+                    (input_size, input_size), interpolation=InterpolationMode.BICUBIC
+                ),
+                T.ToTensor(),
+                T.Normalize(mean=MEAN, std=STD),
+            ]
+        )
+        return transform
+
+    def _find_closest_aspect_ratio(
+        self, aspect_ratio, target_ratios, width, height, image_size
+    ):
+        best_ratio_diff = float("inf")
+        best_ratio = (1, 1)
+        area = width * height
+        for ratio in target_ratios:
+            target_aspect_ratio = ratio[0] / ratio[1]
+            ratio_diff = abs(aspect_ratio - target_aspect_ratio)
+            if ratio_diff < best_ratio_diff:
+                best_ratio_diff = ratio_diff
+                best_ratio = ratio
+            elif ratio_diff == best_ratio_diff:
+                if area > 0.5 * image_size * image_size * ratio[0] * ratio[1]:
+                    best_ratio = ratio
+        return best_ratio
+
+    def _dynamic_preprocess(
+        self, image, min_num=1, max_num=12, image_size=448, use_thumbnail=False
+    ):
+        orig_width, orig_height = image.size
+        aspect_ratio = orig_width / orig_height
+
+        target_ratios = set(
+            (i, j)
+            for n in range(min_num, max_num + 1)
+            for i in range(1, n + 1)
+            for j in range(1, n + 1)
+            if i * j <= max_num and i * j >= min_num
+        )
+        target_ratios = sorted(target_ratios, key=lambda x: x[0] * x[1])
+
+        target_aspect_ratio = self._find_closest_aspect_ratio(
+            aspect_ratio, target_ratios, orig_width, orig_height, image_size
+        )
+
+        target_width = image_size * target_aspect_ratio[0]
+        target_height = image_size * target_aspect_ratio[1]
+        blocks = target_aspect_ratio[0] * target_aspect_ratio[1]
+
+        resized_img = image.resize((target_width, target_height))
+        processed_images = []
+        for i in range(blocks):
+            box = (
+                (i % (target_width // image_size)) * image_size,
+                (i // (target_width // image_size)) * image_size,
+                ((i % (target_width // image_size)) + 1) * image_size,
+                ((i // (target_width // image_size)) + 1) * image_size,
+            )
+            split_img = resized_img.crop(box)
+            processed_images.append(split_img)
+
+        assert len(processed_images) == blocks
+        if use_thumbnail and len(processed_images) != 1:
+            thumbnail_img = image.resize((image_size, image_size))
+            processed_images.append(thumbnail_img)
+        return processed_images
+
+    model_input_names = ["pixel_values"]
+
+    def preprocess(
+        self,
+        image,
+        params: Dict[str, str] = None,
+        return_tensors="pt",
+    ) -> torch.Tensor:
+
+        if isinstance(image, (str, Image.Image)):
+            if isinstance(image, str):
+                image = Image.open(image)
+
+            if self.do_convert_rgb:
+                image = image.convert("RGB")
+            min_num = (
+                params.get("min_dynamic_patch", self.min_num)
+                if params
+                else self.min_num
+            )
+            max_num = (
+                params.get("max_dynamic_patch", self.max_num)
+                if params
+                else self.max_num
+            )
+            processed_images = self._dynamic_preprocess(
+                image,
+                min_num=min_num,
+                max_num=max_num,
+                image_size=self.size,
+                use_thumbnail=self.use_thumbnail,
+            )
+
+            pixel_values = [self.transform(img) for img in processed_images]
+            pixel_values = torch.stack(pixel_values)
+            data = {"pixel_values": pixel_values}
+            return BatchFeature(data=data, tensor_type="pt")
+
+
+class InternVLImageProcessor(BaseImageProcessor):
+    def __init__(self, hf_config, server_args, _processor=None):
+        super().__init__(hf_config, server_args, _processor)
+
+    @staticmethod
+    def _process_single_image_task(
+        image_data: Union[str, bytes],
+        image_processor=None,
+    ):
+
+        image_processor = global_processor
+
+        try:
+
+            image, image_size = load_image(image_data)
+            if image_size is not None:
+                # It is a video with multiple images
+                image_hash = hash(image_data)
+                pixel_values = image_processor.preprocess(image, None)["pixel_values"]
+                for _ in range(len(pixel_values)):
+                    pixel_values[_] = pixel_values[_].astype(np.float16)
+                pixel_values = np.stack(pixel_values, axis=0)
+                return pixel_values, image_hash, image_size
+            else:
+                # It is an image
+                image_hash = hash(image_data)
+
+                pixel_values = image_processor.preprocess(image, None)["pixel_values"]
+
+                if isinstance(pixel_values, np.ndarray):
+                    pixel_values = pixel_values.astype(np.float16)
+
+                return pixel_values, image_hash, image.size
+        except Exception:
+            logger.error("Exception in TokenizerManager:\n" + get_exception_traceback())
+
+    async def _process_single_image(self, image_data: Union[bytes, str]):
+        if self.executor is not None:
+            loop = asyncio.get_event_loop()
+            return await loop.run_in_executor(
+                self.executor,
+                InternVLImageProcessor._process_single_image_task,
+                image_data,
+            )
+        else:
+            return self._process_single_image_task(image_data)
+
+    async def process_images_async(
+        self,
+        image_data: List[Union[bytes, str]],
+        input_text,
+        request_obj,
+        max_req_input_len,
+    ):
+        if not image_data:
+            return None
+
+        if isinstance(image_data, list) and len(image_data) > 0:
+            # Multiple images
+            if len(image_data) > 1:
+                pixel_values, image_hashes, image_sizes = [], [], []
+                res = []
+                for img_data in image_data:
+                    res.append(self._process_single_image(img_data))
+                res = await asyncio.gather(*res)
+                for pixel_v, image_h, image_s in res:
+                    pixel_values.append(pixel_v)
+                    image_hashes.append(image_h)
+                    image_sizes.append(image_s)
+
+                if isinstance(pixel_values[0], np.ndarray):
+                    pixel_values = np.stack(pixel_values, axis=0)
+            else:
+                # A single image
+                pixel_values, image_hash, image_size = await self._process_single_image(
+                    image_data[0]
+                )
+                pixel_values = [pixel_values]
+                image_hashes = [image_hash]
+                image_sizes = [image_size]
+        elif isinstance(image_data, str):
+            # A single image
+            pixel_values, image_hash, image_size = await self._process_single_image(
+                image_data
+            )
+            pixel_values = [pixel_values]
+            image_hashes = [image_hash]
+            image_sizes = [image_size]
+        else:
+            raise ValueError(f"Invalid image data: {image_data}")
+
+        return {
+            "pixel_values": pixel_values,
+            "image_hashes": image_hashes,
+            "image_sizes": image_sizes,
+            "modalities": request_obj.modalities or ["image"],
+        }
+
+
 def get_image_processor(
     hf_config, server_args: ServerArgs, processor
 ) -> BaseImageProcessor:
@@ -640,6 +889,8 @@ def get_image_processor(
 
     elif "MiniCPMV" in hf_config.architectures:
         return MiniCPMVImageProcessor(hf_config, server_args, processor)
+    elif "InternVLChatModel" in hf_config.architectures:
+        return InternVLImageProcessor(hf_config, server_args, processor)
     else:
         return LlavaImageProcessor(hf_config, server_args, processor.image_processor)
 
