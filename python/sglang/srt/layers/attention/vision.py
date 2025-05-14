@@ -200,6 +200,7 @@ class VisionSdpaAttention(nn.Module):
                 dropout_p=self.dropout,
                 is_causal=False,
             )
+            del attention_mask
 
         # [b, h, s, head_size] --> [b * s, h, head_size]
         output = rearrange(output, "b h s d -> (b s) h d")
